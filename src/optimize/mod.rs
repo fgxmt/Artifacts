@@ -7,6 +7,7 @@ mod slot_rating;
 mod targeting;
 
 pub use brute_force::brute_force_optimal_loadout;
+pub(crate) use eligibility::{is_healing_consumable, meets_conditions};
 pub use skills::{refining_skill_for, skill_level, skill_xp_progress};
 pub use slot_rating::{
     current_slot_rating, equipped_codes, optimize_combat_loadout, optimize_items, ItemRole,
@@ -16,3 +17,4 @@ pub use targeting::{
     find_optimal_crafting, find_optimal_gathering, find_optimal_monster, locations_raw_for,
     GatherTarget, MonsterTarget,
 };
+pub(crate) use targeting::find_best_material_drop_target;

@@ -7,6 +7,10 @@ use crate::flags::{Flag, FlagAction, GameState};
 use crate::types::{Character, DepositItem, EquipBody, Result, UnequipBody};
 
 use super::bank_ops::deposit_all;
+use super::consumables::ensure_healing_consumables;
+use super::crafting_exec::run_crafting_phase;
+use super::crafting_plan::refresh_shared_crafting_state;
+use super::merchant::run_merchant_stint;
 use super::repositioning::{optimize_fight, optimize_gather};
 use super::CharacterRole;
 
@@ -144,6 +148,16 @@ pub(crate) async fn handle_flags(
                     items.iter().map(|i| format!("{}x {}", i.quantity, i.code)).collect::<Vec<_>>()
                 );
                 // TODO: call bank withdraw endpoint per item
+            }
+            FlagAction::HealingConsumablesAvailable => {
+                *character = ensure_healing_consumables(client, name, character.clone(), state).await?;
+            }
+            FlagAction::CraftWishlistGearAvailable => {
+                *character = run_crafting_phase(client, name, character.clone(), state).await?;
+                refresh_shared_crafting_state(state, character);
+            }
+            FlagAction::MerchantSummon => {
+                *character = run_merchant_stint(name, character.clone()).await?;
             }
             FlagAction::EquipUpgrade { .. } => unreachable!("EquipUpgrade flags are handled in the batch above"),
         }

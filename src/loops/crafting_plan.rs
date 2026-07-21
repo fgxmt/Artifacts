@@ -1,14 +1,38 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flags::GameState;
-use crate::formulas::{calculate_crafting_xp, craft_xp_per_ingredient, is_recyclable_for_wishlist, recycle_returns_per_ingredient, xp_to_next_level};
+use crate::formulas::{calculate_crafting_xp, craft_xp_per_ingredient, xp_to_next_level};
 use crate::optimize::{current_slot_rating, skill_level, skill_xp_progress};
-use crate::types::{Character, Item};
+use crate::types::Character;
 
 use super::bank_ops::print_plan;
 
 pub(crate) const CRAFTING_SKILLS: [&str; 3] = ["weaponcrafting", "gearcrafting", "jewelrycrafting"];
 pub(crate) const WISHLIST_SKILLS: [&str; 4] = ["weaponcrafting", "gearcrafting", "jewelrycrafting", "alchemy"];
+
+/// Refreshes `state`'s shared snapshot of the alchemy-crafting character: the lowest of
+/// weaponcrafting/gearcrafting/jewelrycrafting level (every fighting character's reference for
+/// whether to prioritize wishlist-material-drop farming over XP/hour, and this character's own
+/// promotion threshold), and the current wishlist split into equipment vs. alchemy item codes
+/// (the bank-deposit craft trigger and drop-farming target selection are both equipment-only,
+/// with alchemy only ever a drop-farming fallback — see `GameState::wishlist_equipment_codes`).
+/// Cheap and side-effect-free beyond the `GameState` write, so it's fine to call every cycle
+/// regardless of whether anything actually changed.
+pub(crate) fn refresh_shared_crafting_state(state: &GameState, character: &Character) {
+    let min_gear_level = CRAFTING_SKILLS.iter().map(|&skill| skill_level(character, skill)).min().unwrap_or(1);
+    state.set_crafter_min_gear_level(min_gear_level);
+
+    let wishlist = build_wishlist(state, character);
+    let equipment_codes: Vec<String> = wishlist.iter()
+        .filter(|e| CRAFTING_SKILLS.contains(&e.skill.as_str()))
+        .map(|e| e.code.clone())
+        .collect();
+    let alchemy_codes: Vec<String> = wishlist.iter()
+        .filter(|e| e.skill == "alchemy")
+        .map(|e| e.code.clone())
+        .collect();
+    state.set_wishlist(&character.name, equipment_codes, alchemy_codes);
+}
 
 /// Which of the three priority tiers a planned craft belongs to — equipment upgrades outrank
 /// next-tier wishlist progress, which outranks generic XP-maximizing filler.
@@ -173,31 +197,13 @@ pub(crate) fn build_wishlist(state: &GameState, character: &Character) -> Vec<Cr
     entries
 }
 
-/// Net per-unit ingredient need for one craft of `item` under `skill`, after subtracting the
-/// expected recycling return (weaponcrafting/gearcrafting/jewelrycrafting only — a no-op
-/// passthrough for alchemy, which is never recyclable). `f64`, un-rounded — callers round once
-/// after multiplying by however many crafts they're projecting, not per unit.
-fn net_ingredient_need(item: &Item, skill: &str) -> HashMap<String, f64> {
-    let craft = item.craft.as_ref().unwrap();
-    let returns = if is_recyclable_for_wishlist(item, skill) {
-        recycle_returns_per_ingredient(craft)
-    } else {
-        HashMap::new()
-    };
-    craft.items.iter()
-        .map(|ing| {
-            let net = (ing.quantity as f64 - returns.get(&ing.code).copied().unwrap_or(0.0)).max(0.0);
-            (ing.code.clone(), net)
-        })
-        .collect()
-}
-
-/// Splits wishlist `entries` into what's craftable right now against `remaining_supply` (net of
-/// expected recycling returns) and what's reserved for later. Unlike `allocate_upgrade_crafts`'s
-/// all-or-nothing equip demand, a wishlist entry is *partially* fillable: crafts as many as
-/// `remaining_supply` allows (bounded by the scarcest net-of-recycling ingredient, clamped to the
-/// entry's projected `crafts_needed`), and reserves the shortfall's direct ingredients for the
-/// rest.
+/// Splits wishlist `entries` into what's craftable right now against `remaining_supply` and
+/// what's reserved for later. Unlike `allocate_upgrade_crafts`'s all-or-nothing equip demand, a
+/// wishlist entry is *partially* fillable: crafts as many as `remaining_supply` allows (bounded
+/// by the scarcest ingredient, clamped to the entry's projected `crafts_needed`), and reserves the
+/// shortfall's direct ingredients for the rest. Sized against the recipe's full nominal ingredient
+/// quantities — no discount for expected recycling returns, since nothing in these loops ever
+/// actually recycles a crafted item back into materials.
 pub(crate) fn classify_wishlist_craftable(
     state: &GameState,
     character: &Character,
@@ -212,22 +218,16 @@ pub(crate) fn classify_wishlist_craftable(
         let craft = match &item.craft { Some(c) => c, None => continue };
         if craft.level.is_some_and(|req| skill_level(character, &entry.skill) < req) { continue; } // defensive; build_wishlist already filters this
 
-        let per_unit = net_ingredient_need(item, &entry.skill);
-
-        let max_affordable = per_unit.iter()
-            .filter(|(_, &qty)| qty > 0.0)
-            .map(|(code, &qty)| {
-                let have = remaining_supply.get(code).copied().unwrap_or(0) as f64;
-                (have / qty).floor() as i32
-            })
+        let max_affordable = craft.items.iter()
+            .filter(|ing| ing.quantity > 0)
+            .map(|ing| remaining_supply.get(&ing.code).copied().unwrap_or(0) / ing.quantity)
             .min()
             .unwrap_or(0)
             .clamp(0, entry.quantity);
 
         if max_affordable > 0 {
-            for (code, qty) in &per_unit {
-                let need = (qty * max_affordable as f64).ceil() as i32;
-                *remaining_supply.entry(code.clone()).or_insert(0) -= need;
+            for ing in &craft.items {
+                *remaining_supply.entry(ing.code.clone()).or_insert(0) -= ing.quantity * max_affordable;
             }
             craftable.push(CraftPlanEntry {
                 code: entry.code.clone(), skill: entry.skill.clone(), quantity: max_affordable, tier: PlanTier::Wishlist,
@@ -236,9 +236,8 @@ pub(crate) fn classify_wishlist_craftable(
 
         let shortfall = entry.quantity - max_affordable;
         if shortfall > 0 {
-            for (code, qty) in &per_unit {
-                let need = (qty * shortfall as f64).ceil() as i32;
-                *reserved.entry(code.clone()).or_insert(0) += need;
+            for ing in &craft.items {
+                *reserved.entry(ing.code.clone()).or_insert(0) += ing.quantity * shortfall;
             }
         }
     }
@@ -246,18 +245,20 @@ pub(crate) fn classify_wishlist_craftable(
     (craftable, reserved)
 }
 
-/// Weaponcrafting/gearcrafting/jewelrycrafting items (excluding anything already queued as an
-/// upgrade or wishlist entry) the character can currently craft. Grouped by skill, lowest-level
-/// skill first (so a lagging skill catches up instead of one skill racing ahead of the other two),
-/// and within each skill ranked by XP per ingredient — the fallback once upgrade and wishlist
-/// demand are satisfied.
+/// Weaponcrafting/gearcrafting/jewelrycrafting/alchemy items (excluding anything already queued
+/// as an upgrade or wishlist entry) the character can currently craft. The three equipment-crafting
+/// skills are grouped first, lowest-level first (so a lagging skill catches up instead of one
+/// racing ahead of the other two), with alchemy always walked last — so when an ingredient is
+/// shared between an equipment recipe and an alchemy recipe, the equipment recipe claims it first.
+/// Within each skill, candidates are ranked by XP per ingredient — the fallback once upgrade and
+/// wishlist demand are satisfied.
 pub(crate) fn filler_candidates(state: &GameState, character: &Character, exclude: &HashSet<String>) -> Vec<CraftPlanEntry> {
     let mut skills_by_level = CRAFTING_SKILLS;
     skills_by_level.sort_by_key(|&skill| skill_level(character, skill));
 
     let mut result = Vec::new();
 
-    for skill in skills_by_level {
+    for skill in skills_by_level.into_iter().chain(std::iter::once("alchemy")) {
         let char_level = skill_level(character, skill);
         let mut candidates: Vec<(String, f64)> = Vec::new();
 
@@ -356,7 +357,7 @@ mod tests {
     use super::*;
     use crate::api::GameData;
     use crate::optimize::{RankedItem, SlotRating};
-    use crate::types::{CraftIngredient, CraftInfo};
+    use crate::types::{CraftIngredient, CraftInfo, Item};
 
     fn blank_character() -> Character {
         Character {

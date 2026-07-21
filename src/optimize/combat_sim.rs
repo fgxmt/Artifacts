@@ -50,6 +50,51 @@ fn monster_worst_damage(monster: &Monster, character: &Character) -> f64 {
     if monster.critical_strike <= 0 { base } else { base * 1.5 }
 }
 
+// ── Health-potion healing ────────────────────────────────────────────────────
+//
+// A (non-splash) health potion equipped in a utility slot auto-triggers each round it's still
+// stocked: "Restores N HP at the start of the turn if the player has lost more than 50% of their
+// health points." This only models that one effect code (`restore`) — other utility effects
+// (damage/resistance boosts, antidotes, splash healing for allies, teleports, ...) aren't combat-
+// simulated here, same as before.
+
+#[derive(Clone)]
+struct RestorePotion {
+    value: i32,
+    quantity: i32,
+}
+
+/// Every equipped utility-slot item with a `restore` effect and remaining charges, resolved from
+/// `character`'s utility slots against `data`'s item list.
+fn restore_potions(character: &Character, data: &GameData) -> Vec<RestorePotion> {
+    [
+        (character.utility1_slot.as_str(), character.utility1_slot_quantity),
+        (character.utility2_slot.as_str(), character.utility2_slot_quantity),
+    ]
+    .into_iter()
+    .filter(|(code, qty)| !code.is_empty() && *qty > 0)
+    .filter_map(|(code, qty)| {
+        let item = data.items.iter().find(|i| i.code == code)?;
+        let value = item.effects.iter().find(|e| e.code == "restore")?.value;
+        Some(RestorePotion { value, quantity: qty })
+    })
+    .collect()
+}
+
+/// Start-of-round healing: every potion with charges remaining procs once `hp` has dropped below
+/// 50% of `max_hp`, each restoring its value (capped at `max_hp`) and consuming one charge.
+fn apply_restore_potions(hp: f64, max_hp: f64, potions: &mut [RestorePotion]) -> f64 {
+    if hp >= max_hp / 2.0 { return hp; }
+    let mut hp = hp;
+    for p in potions.iter_mut() {
+        if p.quantity > 0 {
+            hp = (hp + p.value as f64).min(max_hp);
+            p.quantity -= 1;
+        }
+    }
+    hp
+}
+
 // ── Turn-order helpers ───────────────────────────────────────────────────────
 
 /// None = exact tie on both initiative and HP.
@@ -69,15 +114,19 @@ fn turn_order(character_initiative: i32, character_hp: i32, monster: &Monster) -
 
 fn simulate_battle(
     char_hp: f64,
+    max_hp: f64,
     char_dmg: f64,
     monster_hp: f64,
     monster_dmg: f64,
     char_first: bool,
+    potions: &[RestorePotion],
 ) -> BattleResult {
     let mut char_hp = char_hp;
     let mut monster_hp = monster_hp;
+    let mut potions: Vec<RestorePotion> = potions.to_vec();
 
     for round in 1..=100 {
+        char_hp = apply_restore_potions(char_hp, max_hp, &mut potions);
         if char_first {
             monster_hp -= char_dmg;
             if monster_hp <= 0.0 { return BattleResult { won: true, turns: round }; }
@@ -102,16 +151,17 @@ fn xp_per_hour(xp: f64, turns: i32, haste: i32) -> f64 {
     xp / (cooldown / 3600.0)
 }
 
-pub(crate) fn evaluate_average(character: &Character, monster: &Monster) -> f64 {
+pub(crate) fn evaluate_average(character: &Character, monster: &Monster, data: &GameData) -> f64 {
     let char_dmg = char_avg_damage(character, monster);
     let mon_dmg  = monster_avg_damage(monster, character);
     let xp       = calculate_xp(character, monster);
+    let potions  = restore_potions(character, data);
 
     let sim = |char_first: bool| -> f64 {
         let r = simulate_battle(
-            character.max_hp as f64, char_dmg,
+            character.max_hp as f64, character.max_hp as f64, char_dmg,
             monster.hp as f64,       mon_dmg,
-            char_first,
+            char_first, &potions,
         );
         if r.won { xp_per_hour(xp, r.turns, character.haste) } else { 0.0 }
     };
@@ -122,22 +172,14 @@ pub(crate) fn evaluate_average(character: &Character, monster: &Monster) -> f64 
     }
 }
 
-/// Turn-by-turn worst-case simulation (mirrors `simulate_battle`'s round loop, but instead of
-/// testing a fixed starting HP for win/loss, it tracks cumulative worst-case damage taken and
-/// derives the minimum starting HP that would have survived it) — the minimum HP `character`
-/// needs to guarantee beating `monster`, assuming worst-case damage every round (character never
-/// crits unless guaranteed to, monster always crits unless guaranteed not to). `None` if the
-/// character can't damage the monster at all, or the fight would run past the 100-round cap.
-pub(crate) fn minimum_hp_threshold(character: &Character, monster: &Monster) -> Option<i32> {
-    let char_dmg = char_worst_damage(character, monster);
-    let mon_dmg  = monster_worst_damage(monster, character);
-
-    if char_dmg <= 0.0 { return None; }
-
-    let char_first = turn_order(character.initiative, character.max_hp, monster).unwrap_or_default();
-
-    let mut monster_hp    = monster.hp as f64;
-    let mut damage_taken  = 0.0_f64;
+/// Closed-form worst-case threshold with no health potions in the mix: tracks cumulative
+/// worst-case damage taken and derives the minimum starting HP that would have survived it,
+/// instead of testing a fixed starting HP for win/loss. Kept as its own exact path (rather than
+/// folded into `survives_from`'s binary search) so the no-potion case — overwhelmingly the common
+/// one — is unchanged from before health potions existed.
+fn minimum_hp_threshold_no_potions(char_dmg: f64, mon_dmg: f64, monster_hp: f64, char_first: bool) -> Option<i32> {
+    let mut monster_hp = monster_hp;
+    let mut damage_taken = 0.0_f64;
 
     for _round in 1..=100 {
         if char_first {
@@ -154,14 +196,83 @@ pub(crate) fn minimum_hp_threshold(character: &Character, monster: &Monster) -> 
     None
 }
 
+/// Worst-case survival check: starting this fight at `start_hp` (out of `max_hp`), does the
+/// character kill `monster` before dying, under worst-case damage every round and any equipped
+/// health potions' start-of-round auto-heal?
+fn survives_from(start_hp: i32, max_hp: i32, char_dmg: f64, mon_dmg: f64, monster_hp: f64, char_first: bool, potions: &[RestorePotion]) -> bool {
+    let mut char_hp = start_hp as f64;
+    let mut monster_hp = monster_hp;
+    let mut potions: Vec<RestorePotion> = potions.to_vec();
+
+    for _round in 1..=100 {
+        char_hp = apply_restore_potions(char_hp, max_hp as f64, &mut potions);
+        if char_first {
+            monster_hp -= char_dmg;
+            if monster_hp <= 0.0 { return true; }
+            char_hp -= mon_dmg;
+            if char_hp <= 0.0 { return false; }
+        } else {
+            char_hp -= mon_dmg;
+            if char_hp <= 0.0 { return false; }
+            monster_hp -= char_dmg;
+            if monster_hp <= 0.0 { return true; }
+        }
+    }
+
+    false
+}
+
+/// The minimum HP `character` needs to guarantee beating `monster`, assuming worst-case damage
+/// every round (character never crits unless guaranteed to, monster always crits unless
+/// guaranteed not to) and any equipped health potions' auto-heal. `None` if the character can't
+/// damage the monster at all, or the fight would run past the 100-round cap even at full HP.
+///
+/// With no potions equipped this is the exact closed-form calculation (cumulative damage taken
+/// has a single fixed total, so the minimum starting HP is a direct formula). With potions,
+/// whether a heal triggers depends on HP relative to `max_hp` at that moment, which itself depends
+/// on starting HP — no more direct formula, so this binary-searches the minimum starting HP (in
+/// `[1, max_hp]`) that survives a forward simulation. More starting HP only ever delays when the
+/// 50%-loss heal threshold is crossed, never causing extra damage or fewer heals, so survival is
+/// monotonic in starting HP and the search is sound.
+pub(crate) fn minimum_hp_threshold(character: &Character, monster: &Monster, data: &GameData) -> Option<i32> {
+    let char_dmg = char_worst_damage(character, monster);
+    let mon_dmg  = monster_worst_damage(monster, character);
+
+    if char_dmg <= 0.0 { return None; }
+
+    let char_first = turn_order(character.initiative, character.max_hp, monster).unwrap_or_default();
+    let potions = restore_potions(character, data);
+
+    if potions.is_empty() {
+        return minimum_hp_threshold_no_potions(char_dmg, mon_dmg, monster.hp as f64, char_first);
+    }
+
+    let max_hp = character.max_hp;
+    if !survives_from(max_hp, max_hp, char_dmg, mon_dmg, monster.hp as f64, char_first, &potions) {
+        return None;
+    }
+
+    let mut lo = 1;
+    let mut hi = max_hp;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if survives_from(mid, max_hp, char_dmg, mon_dmg, monster.hp as f64, char_first, &potions) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Some(lo)
+}
+
 /// The best (monster, XP/hour) pair among monsters `character` can guarantee beating — the same
 /// selection `find_optimal_monster` makes, but synchronous (no `get_character` fetch) and silent
 /// (no per-monster table print).
 fn best_fightable<'a>(character: &Character, data: &'a GameData) -> Option<(&'a Monster, f64)> {
     data.monsters.iter()
         .filter_map(|m| {
-            let threshold = minimum_hp_threshold(character, m)?;
-            (threshold <= character.max_hp).then(|| (m, evaluate_average(character, m)))
+            let threshold = minimum_hp_threshold(character, m, data)?;
+            (threshold <= character.max_hp).then(|| (m, evaluate_average(character, m, data)))
         })
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
 }
@@ -177,6 +288,7 @@ pub(crate) fn best_achievable_xph(character: &Character, data: &GameData) -> f64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Item, ItemEffect};
 
     fn blank_character() -> Character {
         Character {
@@ -219,6 +331,19 @@ mod tests {
         }
     }
 
+    fn blank_data(items: Vec<Item>) -> GameData {
+        GameData { monsters: vec![], items, resources: vec![], maps: vec![], craftable_equip: vec![] }
+    }
+
+    fn health_potion_item(code: &str, restore: i32) -> Item {
+        Item {
+            name: code.into(), code: code.into(), level: 1, item_type: "utility".into(),
+            subtype: "potion".into(), description: "".into(), conditions: vec![],
+            effects: vec![ItemEffect { code: "restore".into(), value: restore, description: "".into() }],
+            craft: None, tradeable: true, recyclable: false,
+        }
+    }
+
     /// Old closed-form implementation, kept here only to cross-check the new turn-by-turn
     /// simulation produces identical results (worst-case damage is constant per round, so the
     /// two approaches should always agree exactly).
@@ -257,7 +382,7 @@ mod tests {
             monster.initiative = minit;
 
             let expected = minimum_hp_threshold_closed_form(&character, &monster);
-            let actual   = minimum_hp_threshold(&character, &monster);
+            let actual   = minimum_hp_threshold(&character, &monster, &blank_data(vec![]));
             assert_eq!(actual, expected, "mismatch for atk={atk} init={init} hp={hp} matk={matk} minit={minit}");
         }
     }
@@ -269,6 +394,62 @@ mod tests {
         let mut monster = blank_monster();
         monster.hp = 100_000;
         monster.attack_fire = 5;
-        assert_eq!(minimum_hp_threshold(&character, &monster), None);
+        assert_eq!(minimum_hp_threshold(&character, &monster, &blank_data(vec![])), None);
+    }
+
+    /// A monster that's unsurvivable with no healing becomes survivable once a health potion is
+    /// equipped in a utility slot — the whole point of modeling `restore` in the simulator.
+    #[test]
+    fn health_potion_unlocks_otherwise_unsurvivable_monster() {
+        let mut character = blank_character();
+        character.attack_fire = 26; // kills a 500hp monster in ~20 rounds
+        character.max_hp = 100;
+        character.utility1_slot = "small_health_potion".into();
+        character.utility1_slot_quantity = 10;
+
+        let mut monster = blank_monster();
+        monster.hp = 500;
+        monster.attack_fire = 15; // lethal cumulative damage without healing
+        monster.initiative = 100; // monster always goes first
+
+        let data = blank_data(vec![health_potion_item("small_health_potion", 30)]);
+
+        let without_potion = {
+            let mut bare = character.clone();
+            bare.utility1_slot = "".into();
+            bare.utility1_slot_quantity = 0;
+            minimum_hp_threshold(&bare, &monster, &data)
+        };
+        let with_potion = minimum_hp_threshold(&character, &monster, &data);
+
+        assert!(with_potion.is_some(), "expected the potion to make this monster survivable");
+        assert!(
+            with_potion.unwrap() < without_potion.unwrap_or(i32::MAX),
+            "potion should lower (or unlock) the survivable HP threshold: with={:?} without={:?}",
+            with_potion, without_potion,
+        );
+    }
+
+    /// A potion only heals when HP has dropped below 50% of max, restores the right amount capped
+    /// at max_hp, and consumes exactly one charge per proc — then stops healing once charges run
+    /// out, so the simulator never credits infinite free healing from a finite stock.
+    #[test]
+    fn apply_restore_potions_respects_threshold_cap_and_charges() {
+        let mut potions = vec![RestorePotion { value: 30, quantity: 2 }];
+
+        // At/above 50% of max_hp (100) -> no heal, no charge spent.
+        assert_eq!(apply_restore_potions(60.0, 100.0, &mut potions), 60.0);
+        assert_eq!(potions[0].quantity, 2);
+
+        // Below 50% -> heals by the potion's value and consumes a charge.
+        assert_eq!(apply_restore_potions(10.0, 100.0, &mut potions), 40.0);
+        assert_eq!(potions[0].quantity, 1);
+
+        // Healing is capped at max_hp even if the raw restore would overshoot it.
+        assert_eq!(apply_restore_potions(15.0, 40.0, &mut potions), 40.0);
+        assert_eq!(potions[0].quantity, 0);
+
+        // Out of charges -> no more healing, even while still below the threshold.
+        assert_eq!(apply_restore_potions(10.0, 100.0, &mut potions), 10.0);
     }
 }

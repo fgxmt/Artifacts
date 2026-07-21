@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use reqwest::Client;
 
-use crate::api::{craft_item, deposit_items, get_bank_items, move_character, wait_for_cooldown, withdraw_items};
+use crate::api::{craft_item, deposit_gold, deposit_items, get_bank_items, move_character, wait_for_cooldown, withdraw_items};
 use crate::flags::GameState;
 use crate::optimize::locations_raw_for;
 use crate::types::{Character, DepositItem, Result};
@@ -156,6 +156,13 @@ pub(crate) async fn run_crafting_phase(
             wait_for_cooldown(&result.cooldown).await;
             character = result.character;
             if let Ok(bank) = get_bank_items(client).await { state.update_bank(bank).await; }
+        }
+
+        if character.gold > 0 {
+            println!("[{}] Depositing {} gold to bank...", crate::ts_char(name), character.gold);
+            let result = deposit_gold(client, name, character.gold).await?;
+            wait_for_cooldown(&result.cooldown).await;
+            character = result.character;
         }
     }
 

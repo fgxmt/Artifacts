@@ -11,6 +11,11 @@ pub struct DepositItem {
     pub quantity: i32,
 }
 
+#[derive(Serialize)]
+pub struct GoldBody {
+    pub quantity: i32,
+}
+
 #[derive(Deserialize)]
 pub struct DepositResponseData {
     pub cooldown: Cooldown,
@@ -69,6 +74,23 @@ pub struct CraftResponseData {
 pub struct CraftResult {
     pub xp: i32,
     pub items: Vec<GatherDrop>,
+    pub cooldown: Cooldown,
+    pub character: Character,
+}
+
+#[derive(Serialize)]
+pub struct UseItemBody {
+    pub code: String,
+    pub quantity: i32,
+}
+
+#[derive(Deserialize)]
+pub struct UseItemResponseData {
+    pub cooldown: Cooldown,
+    pub character: Character,
+}
+
+pub struct UseItemResult {
     pub cooldown: Cooldown,
     pub character: Character,
 }

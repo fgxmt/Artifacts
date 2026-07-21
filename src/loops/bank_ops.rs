@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use reqwest::Client;
 
-use crate::api::{deposit_items, get_bank_items, move_character, wait_for_cooldown};
+use crate::api::{deposit_gold, deposit_items, get_bank_items, move_character, wait_for_cooldown};
 use crate::flags::GameState;
 use crate::types::{Character, DepositItem, InventorySlot, Result};
 
@@ -11,25 +11,37 @@ pub(crate) fn inventory_qty(inventory: &[InventorySlot], code: &str) -> i32 {
     inventory.iter().filter(|s| s.code == code).map(|s| s.quantity).sum()
 }
 
-/// Deposits everything in `character`'s inventory at the bank (moving there first if needed)
-/// and refreshes the cached bank snapshot.
+/// Deposits everything in `character`'s inventory and all held gold at the bank (moving there
+/// first if needed), and refreshes the cached bank snapshot.
 pub(crate) async fn deposit_all(client: &Client, name: &'static str, character: Character, state: &GameState) -> Result<Character> {
     let items_to_deposit: Vec<DepositItem> = character.inventory.iter()
         .filter(|s| s.quantity > 0 && !s.code.is_empty())
         .map(|s| DepositItem { code: s.code.clone(), quantity: s.quantity })
         .collect();
-    if items_to_deposit.is_empty() { return Ok(character); }
+    if items_to_deposit.is_empty() && character.gold <= 0 { return Ok(character); }
 
     if character.x != 4 || character.y != 1 {
         let result = move_character(client, name, 4, 1).await?;
         wait_for_cooldown(&result.cooldown).await;
     }
-    println!("[{}] Depositing {} item stack(s) to bank...", crate::ts_char(name), items_to_deposit.len());
-    let result = deposit_items(client, name, items_to_deposit).await?;
-    wait_for_cooldown(&result.cooldown).await;
-    if let Ok(bank) = get_bank_items(client).await { state.update_bank(bank).await; }
 
-    Ok(result.character)
+    let mut character = character;
+    if !items_to_deposit.is_empty() {
+        println!("[{}] Depositing {} item stack(s) to bank...", crate::ts_char(name), items_to_deposit.len());
+        let result = deposit_items(client, name, items_to_deposit).await?;
+        wait_for_cooldown(&result.cooldown).await;
+        character = result.character;
+        if let Ok(bank) = get_bank_items(client).await { state.update_bank(bank).await; }
+    }
+
+    if character.gold > 0 {
+        println!("[{}] Depositing {} gold to bank...", crate::ts_char(name), character.gold);
+        let result = deposit_gold(client, name, character.gold).await?;
+        wait_for_cooldown(&result.cooldown).await;
+        character = result.character;
+    }
+
+    Ok(character)
 }
 
 /// Prints a crafting/refining plan: what's about to be made and how much, plus what's being

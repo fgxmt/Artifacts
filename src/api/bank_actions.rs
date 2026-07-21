@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use crate::flags::GameState;
 use crate::types::{
-    ApiResponse, BankItem, Character, DepositItem, DepositResponseData, DepositResult,
-    PagedResponse, Result,
+    ApiResponse, BankDetails, BankItem, Character, DepositItem, DepositResponseData,
+    DepositResult, GoldBody, PagedResponse, Result,
 };
 
 use super::character_actions::move_character;
@@ -71,6 +71,19 @@ pub async fn withdraw_items(
     Ok(DepositResult { cooldown: data.cooldown, character: data.character })
 }
 
+pub async fn deposit_gold(client: &Client, name: &str, quantity: i32) -> Result<DepositResult> {
+    let url = format!("{}/my/{}/action/bank/deposit/gold", BASE_URL, name);
+    let body = GoldBody { quantity };
+    let resp: ApiResponse<DepositResponseData> = send_with_retry(|| client.post(&url).json(&body)).await?;
+
+    if let Some(err) = resp.error {
+        return Err(err.message.into());
+    }
+
+    let data = resp.data.ok_or("no data in response")?;
+    Ok(DepositResult { cooldown: data.cooldown, character: data.character })
+}
+
 /// Moves to bank, deposits all inventory items, refreshes bank state, then returns to origin.
 /// Each individual action already retries internally; an `Err` here means every retry for some
 /// step was exhausted, and the caller should treat this cycle as failed and restart.
@@ -104,6 +117,12 @@ pub async fn deposit_to_bank(
         state.update_bank(bank).await;
     }
 
+    if character.gold > 0 {
+        println!("[{}] Depositing {} gold to bank...", crate::ts_char(name), character.gold);
+        let result = deposit_gold(client, name, character.gold).await?;
+        wait_for_cooldown(&result.cooldown).await;
+    }
+
     let result = move_character(client, name, origin_x, origin_y).await?;
     wait_for_cooldown(&result.cooldown).await;
     Ok(result.character)
@@ -133,4 +152,17 @@ pub async fn get_bank_items(client: &Client) -> Result<Vec<BankItem>> {
     }
 
     Ok(all_items)
+}
+
+/// Bank account details — slots, expansions, and (unlike anything on `Character`) the bank's own
+/// shared gold balance, separate from any character's currently-held gold.
+pub async fn get_bank_details(client: &Client) -> Result<BankDetails> {
+    let url = format!("{}/my/bank", BASE_URL);
+    let resp: ApiResponse<BankDetails> = decode(client.get(&url).send().await?).await?;
+
+    if let Some(err) = resp.error {
+        return Err(err.message.into());
+    }
+
+    resp.data.ok_or_else(|| "no data in response".into())
 }

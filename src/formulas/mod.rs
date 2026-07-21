@@ -1,7 +1,7 @@
 mod crafting;
-mod recycling;
+mod tiers;
 mod xp;
 
 pub use crafting::*;
-pub use recycling::*;
+pub use tiers::*;
 pub use xp::*;

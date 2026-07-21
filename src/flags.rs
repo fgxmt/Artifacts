@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::api::GameData;
-use crate::optimize::{current_slot_rating, equipped_codes, SlotRating};
+use crate::optimize::{current_slot_rating, equipped_codes, is_healing_consumable, SlotRating};
 use crate::types::{BankItem, Character};
 
 // ── Flag action types ────────────────────────────────────────────────────────
@@ -20,6 +20,20 @@ pub enum FlagAction {
     /// Unequip whatever is in `slot` and equip `item_code` in its place — set
     /// when another character crafts an item that's a ratings upgrade for this one.
     EquipUpgrade { slot: String, item_code: String },
+    /// The bank now holds at least one healing consumable again — set for a fight-loop character
+    /// that previously found both its inventory and the bank empty of them (see
+    /// `GameState::await_healing_consumables`), so it can stop polling and go restock the moment
+    /// any character's bank trip changes that.
+    HealingConsumablesAvailable,
+    /// The bank now holds enough materials to craft at least one wishlisted equipment item
+    /// (weaponcrafting/gearcrafting/jewelrycrafting, not alchemy) — set for the alchemy-crafting
+    /// character, whether it's currently gathering or fighting, so it can go withdraw and craft it
+    /// (see `GameState::set_wishlist` / `update_bank`).
+    CraftWishlistGearAvailable,
+    /// A merchant task has been requested — set for the fishing character, in either its fishing
+    /// or promoted-fighting mode, to temporarily run the (placeholder) merchant loop before
+    /// returning to whichever mode it was in.
+    MerchantSummon,
     // More flag actions can be added here
 }
 
@@ -59,6 +73,36 @@ pub struct GameState {
     /// it deliberately only ever holds an ingredient's "highest stage" (e.g. a bar, not the ore
     /// under it), since refining toward it should still proceed freely.
     reserved_materials: std::sync::Mutex<HashMap<String, i32>>,
+    /// Name of the fight-loop character currently waiting to be told the bank has a healing
+    /// consumable again (`None` most of the time) — see `await_healing_consumables` and
+    /// `update_bank`. A push rather than a poll: without this, a character that found the bank
+    /// empty would have no way to learn it's been restocked short of re-checking on every fight.
+    awaiting_healing_consumables: std::sync::Mutex<Option<String>>,
+    /// The dedicated fighting character's current combat level — seeded during program init and
+    /// kept fresh by that character's own loop on every level-up. Read by mining/woodcutting/
+    /// fishing/alchemy characters (via `formulas::gather_promotion_threshold`) to decide whether
+    /// their own skill level has outpaced it enough to switch into fighting themselves (see
+    /// `loops::promotion`). Defaults to 1 until seeded, so promotion logic must not run before
+    /// program init has called `set_fighter_combat_level` at least once.
+    fighter_combat_level: std::sync::Mutex<i32>,
+    /// The alchemy-crafting character's lowest of weaponcrafting/gearcrafting/jewelrycrafting
+    /// level — kept fresh the same way as `fighter_combat_level`. Read by every currently-fighting
+    /// character (original or promoted) to decide whether to prioritize wishlist-material-drop
+    /// farming over plain combat XP/hour (see `loops::repositioning`).
+    crafter_min_gear_level: std::sync::Mutex<i32>,
+    /// Name of the alchemy-crafting character that owns `wishlist_equipment_codes`/
+    /// `wishlist_alchemy_codes` — `None` until it's set them at least once.
+    wishlist_owner: std::sync::Mutex<Option<String>>,
+    /// Current wishlist item codes for weaponcrafting/gearcrafting/jewelrycrafting, refreshed every
+    /// cycle (in either of its modes) by the alchemy-crafting character. Used by `update_bank` to
+    /// flag it the moment the bank holds enough materials to craft one, and by fighting characters
+    /// to prioritize monsters that drop those materials (see `FlagAction::CraftWishlistGearAvailable`
+    /// and `loops::repositioning`).
+    wishlist_equipment_codes: std::sync::Mutex<Vec<String>>,
+    /// Same as `wishlist_equipment_codes` but for alchemy — only consulted as a fallback for
+    /// drop-farming when no equipment-wishlist material is droppable by anything guaranteed-
+    /// beatable; never used for the bank-deposit craft trigger (that's equipment-only).
+    wishlist_alchemy_codes: std::sync::Mutex<Vec<String>>,
 }
 
 impl GameState {
@@ -70,6 +114,12 @@ impl GameState {
             item_ratings: std::sync::Mutex::new(HashMap::new()),
             equipped: std::sync::Mutex::new(HashMap::new()),
             reserved_materials: std::sync::Mutex::new(HashMap::new()),
+            awaiting_healing_consumables: std::sync::Mutex::new(None),
+            fighter_combat_level: std::sync::Mutex::new(1),
+            crafter_min_gear_level: std::sync::Mutex::new(1),
+            wishlist_owner: std::sync::Mutex::new(None),
+            wishlist_equipment_codes: std::sync::Mutex::new(Vec::new()),
+            wishlist_alchemy_codes: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -106,6 +156,47 @@ impl GameState {
         self.reserved_materials.lock().unwrap().clone()
     }
 
+    /// Registers `name` as waiting to be told the bank has a healing consumable again — call this
+    /// only after confirming both the character's inventory and the bank are currently empty of
+    /// them, so there's nothing else to do but wait for `update_bank` to notice a restock.
+    pub fn await_healing_consumables(&self, name: &str) {
+        *self.awaiting_healing_consumables.lock().unwrap() = Some(name.to_string());
+    }
+
+    pub fn set_fighter_combat_level(&self, level: i32) {
+        *self.fighter_combat_level.lock().unwrap() = level;
+    }
+
+    pub fn fighter_combat_level(&self) -> i32 {
+        *self.fighter_combat_level.lock().unwrap()
+    }
+
+    pub fn set_crafter_min_gear_level(&self, level: i32) {
+        *self.crafter_min_gear_level.lock().unwrap() = level;
+    }
+
+    pub fn crafter_min_gear_level(&self) -> i32 {
+        *self.crafter_min_gear_level.lock().unwrap()
+    }
+
+    /// Refreshes the alchemy-crafting character's wishlist snapshot — `equipment_codes` are
+    /// weaponcrafting/gearcrafting/jewelrycrafting wishlist item codes (drives the bank-deposit
+    /// craft trigger and fighting characters' primary drop-farming target), `alchemy_codes` are
+    /// alchemy wishlist item codes (drop-farming fallback only, see `wishlist_alchemy_codes`).
+    pub fn set_wishlist(&self, owner: &str, equipment_codes: Vec<String>, alchemy_codes: Vec<String>) {
+        *self.wishlist_owner.lock().unwrap() = Some(owner.to_string());
+        *self.wishlist_equipment_codes.lock().unwrap() = equipment_codes;
+        *self.wishlist_alchemy_codes.lock().unwrap() = alchemy_codes;
+    }
+
+    pub fn wishlist_equipment_codes(&self) -> Vec<String> {
+        self.wishlist_equipment_codes.lock().unwrap().clone()
+    }
+
+    pub fn wishlist_alchemy_codes(&self) -> Vec<String> {
+        self.wishlist_alchemy_codes.lock().unwrap().clone()
+    }
+
     /// Queues `flag` for `target`. `EquipUpgrade` flags are deduplicated against whatever's
     /// already pending for that character/slot/item, since `update_bank` re-derives them from
     /// scratch on every bank refresh and would otherwise pile up duplicates before the target
@@ -114,12 +205,19 @@ impl GameState {
         let mut flags = self.flags.lock().await;
         let pending = flags.entry(target.to_string()).or_default();
 
-        if let FlagAction::EquipUpgrade { slot, item_code } = &flag.action {
-            let already_pending = pending.iter().any(|f| {
+        let already_pending = match &flag.action {
+            FlagAction::EquipUpgrade { slot, item_code } => pending.iter().any(|f| {
                 matches!(&f.action, FlagAction::EquipUpgrade { slot: s, item_code: c } if s == slot && c == item_code)
-            });
-            if already_pending { return; }
-        }
+            }),
+            FlagAction::HealingConsumablesAvailable => pending.iter()
+                .any(|f| matches!(f.action, FlagAction::HealingConsumablesAvailable)),
+            FlagAction::CraftWishlistGearAvailable => pending.iter()
+                .any(|f| matches!(f.action, FlagAction::CraftWishlistGearAvailable)),
+            FlagAction::MerchantSummon => pending.iter()
+                .any(|f| matches!(f.action, FlagAction::MerchantSummon)),
+            FlagAction::RetrieveFromBank(_) => false,
+        };
+        if already_pending { return; }
 
         println!("[{}] Flag set (from '{}'): {:?}", crate::ts_char(target), flag.from_character, flag.action);
         pending.push(flag);
@@ -138,6 +236,54 @@ impl GameState {
     pub async fn update_bank(&self, items: Vec<BankItem>) {
         *self.bank.lock().await = items;
         self.flag_bank_upgrades().await;
+        self.flag_healing_consumables_restocked().await;
+        self.flag_craftable_wishlist_gear().await;
+    }
+
+    /// If the bank now holds enough materials to craft at least one wishlisted equipment item
+    /// (weaponcrafting/gearcrafting/jewelrycrafting — see `wishlist_equipment_codes`), flags the
+    /// character that owns that wishlist so it can go withdraw and craft it. Runs on every bank
+    /// refresh regardless of who caused it — "deposited... by this character or another" — and is
+    /// safe to re-trigger repeatedly since `set_flag` dedupes `CraftWishlistGearAvailable`.
+    async fn flag_craftable_wishlist_gear(&self) {
+        let Some(owner) = self.wishlist_owner.lock().unwrap().clone() else { return };
+        let codes = self.wishlist_equipment_codes.lock().unwrap().clone();
+        if codes.is_empty() { return; }
+
+        let bank = self.bank_snapshot().await;
+        let any_craftable = codes.iter().any(|code| {
+            self.data.items.iter().find(|i| i.code == *code)
+                .and_then(|i| i.craft.as_ref())
+                .is_some_and(|craft| craft.items.iter().all(|ing| {
+                    bank.iter().find(|b| b.code == ing.code).map(|b| b.quantity).unwrap_or(0) >= ing.quantity
+                }))
+        });
+        if !any_craftable { return; }
+
+        self.set_flag(&owner, Flag {
+            from_character: "bank".to_string(),
+            action: FlagAction::CraftWishlistGearAvailable,
+        }).await;
+    }
+
+    /// If a character is waiting on healing consumables (`awaiting_healing_consumables`) and the
+    /// bank now genuinely has one, flags them and clears the wait — this is what turns any
+    /// character's bank trip into a push notification instead of the waiting character having to
+    /// poll.
+    async fn flag_healing_consumables_restocked(&self) {
+        let Some(name) = self.awaiting_healing_consumables.lock().unwrap().clone() else { return };
+
+        let bank = self.bank_snapshot().await;
+        let has_any = bank.iter().any(|b| {
+            b.quantity > 0 && self.data.items.iter().find(|i| i.code == b.code).is_some_and(is_healing_consumable)
+        });
+        if !has_any { return; }
+
+        *self.awaiting_healing_consumables.lock().unwrap() = None;
+        self.set_flag(&name, Flag {
+            from_character: "bank".to_string(),
+            action: FlagAction::HealingConsumablesAvailable,
+        }).await;
     }
 
     async fn flag_bank_upgrades(&self) {
@@ -345,5 +491,68 @@ mod tests {
 
         let flags = state.drain_flags("char1").await;
         assert!(flags.is_empty(), "should not flag a downgrade from currently-equipped gear");
+    }
+
+    fn make_craft_item(code: &str, ingredients: Vec<(&str, i32)>) -> crate::types::Item {
+        crate::types::Item {
+            name: code.into(), code: code.into(), level: 1, item_type: "weapon".into(),
+            subtype: "".into(), description: "".into(), conditions: vec![], effects: vec![],
+            craft: Some(crate::types::CraftInfo {
+                skill: Some("weaponcrafting".into()),
+                level: None,
+                items: ingredients.into_iter().map(|(c, q)| crate::types::CraftIngredient { code: c.into(), quantity: q }).collect(),
+                quantity: 1,
+            }),
+            tradeable: true, recyclable: false,
+        }
+    }
+
+    /// The bank-deposit craft trigger should only fire once the bank genuinely has enough of
+    /// *every* ingredient for at least one wishlisted equipment item, and only for whichever
+    /// character owns that wishlist.
+    #[tokio::test]
+    async fn craft_wishlist_gear_flag_fires_only_once_fully_craftable() {
+        let data = GameData {
+            monsters: vec![], resources: vec![], maps: vec![], craftable_equip: vec![],
+            items: vec![make_craft_item("iron_sword", vec![("iron_bar", 2), ("wood", 1)])],
+        };
+        let state = GameState::new(data);
+        state.set_wishlist("crafter1", vec!["iron_sword".to_string()], vec![]);
+
+        // Only one of the two ingredients present — must not fire yet.
+        state.update_bank(vec![BankItem { code: "iron_bar".into(), quantity: 2 }]).await;
+        assert!(state.drain_flags("crafter1").await.is_empty(), "should not fire with a missing ingredient");
+
+        // Both ingredients now present in sufficient quantity — should fire.
+        state.update_bank(vec![
+            BankItem { code: "iron_bar".into(), quantity: 2 },
+            BankItem { code: "wood".into(), quantity: 1 },
+        ]).await;
+
+        let flags = state.drain_flags("crafter1").await;
+        assert_eq!(flags.len(), 1);
+        assert!(matches!(flags[0].action, FlagAction::CraftWishlistGearAvailable));
+
+        // Some other character was never registered as the wishlist owner and must never receive it.
+        assert!(state.drain_flags("someone_else").await.is_empty());
+    }
+
+    /// Repeated bank updates that keep the condition true shouldn't pile up duplicate flags before
+    /// the owning character has a chance to drain them.
+    #[tokio::test]
+    async fn craft_wishlist_gear_flag_is_deduplicated() {
+        let data = GameData {
+            monsters: vec![], resources: vec![], maps: vec![], craftable_equip: vec![],
+            items: vec![make_craft_item("iron_sword", vec![("iron_bar", 2)])],
+        };
+        let state = GameState::new(data);
+        state.set_wishlist("crafter1", vec!["iron_sword".to_string()], vec![]);
+
+        state.update_bank(vec![BankItem { code: "iron_bar".into(), quantity: 5 }]).await;
+        state.update_bank(vec![BankItem { code: "iron_bar".into(), quantity: 5 }]).await;
+        state.update_bank(vec![BankItem { code: "iron_bar".into(), quantity: 5 }]).await;
+
+        let flags = state.drain_flags("crafter1").await;
+        assert_eq!(flags.len(), 1, "repeated triggers of the same still-true condition should not pile up");
     }
 }

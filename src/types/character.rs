@@ -13,6 +13,14 @@ pub struct BankItem {
 }
 
 #[derive(Deserialize, Clone)]
+pub struct BankDetails {
+    pub slots: i32,
+    pub expansions: i32,
+    pub next_expansion_cost: i32,
+    pub gold: i32,
+}
+
+#[derive(Deserialize, Clone)]
 pub struct InventorySlot {
     pub slot: i32,
     pub code: String,

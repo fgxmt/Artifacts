@@ -11,7 +11,7 @@ const CRAFT_COOLDOWN_PER_UNIT_SECS: f64 = 5.0;
 /// Expected quantity of `drop` obtained per single gather action. Real game formula: drop
 /// probability = (1/rate) * (1 + prospecting/1000), and each successful drop yields between
 /// `min_quantity` and `max_quantity` (averaged here).
-fn average_drop_yield(drop: &MonsterDrop, prospecting: i32) -> f64 {
+pub(crate) fn average_drop_yield(drop: &MonsterDrop, prospecting: i32) -> f64 {
     let probability  = (1.0 / drop.rate.max(1) as f64) * (1.0 + prospecting as f64 / 1000.0);
     let avg_quantity = (drop.min_quantity + drop.max_quantity) as f64 / 2.0;
     probability * avg_quantity

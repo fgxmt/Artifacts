@@ -3,7 +3,8 @@ use reqwest::Client;
 use crate::types::{
     ApiResponse, CraftBody, CraftResponseData, CraftResult, EquipBody, EquipResponseData,
     EquipResult, FightResponseData, FightResult, GatherResponseData, GatherResult, MoveBody,
-    MoveResponseData, MoveResult, Result, RestResponseData, RestResult, UnequipBody,
+    MoveResponseData, MoveResult, Result, RestResponseData, RestResult, UnequipBody, UseItemBody,
+    UseItemResponseData, UseItemResult,
 };
 
 use super::client::{send_with_retry, BASE_URL};
@@ -154,6 +155,21 @@ pub async fn craft_item(
         cooldown: data.cooldown,
         character: data.character,
     })
+}
+
+pub async fn use_item(client: &Client, name: &str, code: &str, quantity: i32) -> Result<UseItemResult> {
+    let url = format!("{}/my/{}/action/use", BASE_URL, name);
+    let body = UseItemBody { code: code.to_string(), quantity };
+    let resp: ApiResponse<UseItemResponseData> = send_with_retry(|| client.post(&url).json(&body)).await?;
+
+    if let Some(err) = resp.error {
+        return Err(err.message.into());
+    }
+
+    let data = resp.data.ok_or("no data in response")?;
+    println!("[{}] Used {}x {} | Cooldown started: {} seconds", crate::ts_char(name), quantity, code, data.cooldown.total_seconds);
+
+    Ok(UseItemResult { cooldown: data.cooldown, character: data.character })
 }
 
 pub async fn use_transition(client: &Client, name: &str) -> Result<MoveResult> {

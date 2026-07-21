@@ -42,6 +42,13 @@ pub(crate) fn meets_conditions(character: &Character, item: &Item) -> bool {
     item.conditions.iter().all(|c| condition_met(character, c))
 }
 
+/// A food item that heals HP when used outside battle (effect code `heal`) — distinct from a
+/// utility-slot health potion's `restore` effect, which only ever procs mid-fight. Consumables
+/// have no combat-simulation effect of their own; they're eaten between fights, not equipped.
+pub(crate) fn is_healing_consumable(item: &Item) -> bool {
+    item.item_type == "consumable" && item.effects.iter().any(|e| e.code == "heal")
+}
+
 /// Clones `character` and applies (or, with `sign = -1`, removes) `item`'s
 /// combat-relevant effects. Effect codes with no known combat stat (threat,
 /// prospecting, consumable buffs, ...) are ignored.
